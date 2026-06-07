@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 模型权重
+weights/*.pth
+weights/*.ckpt
+weights/*.pt
+weights/*.onnx
+!weights/.gitkeep
+
+# 日志
+logs/
+!logs/.gitkeep
+
+# 数据集
+dataset/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 环境变量
+.env
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# TensorBoard
+runs/
+
+# 输出结果
+output/
+results/

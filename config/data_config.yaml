@@ -1,0 +1,115 @@
+# 数据配置文件
+
+# 数据集根目录（相对于项目根目录）
+data_dir: ./dataset
+
+# 视角选择：all_view / top_view / side_view
+view: all_view
+
+# 图像尺寸
+image_size: 384
+
+# 数据划分比例（训练:验证:测试）
+train_ratio: 0.8
+val_ratio: 0.1
+test_ratio: 0.1
+
+# 随机种子（确保数据划分可复现）
+seed: 42
+
+# 角度范围
+angle_min: 0.0
+angle_max: 80.0
+
+# 支持的图片格式
+image_extensions:
+  - .jpg
+  - .jpeg
+  - .png
+  - .bmp
+
+# 数据加载
+num_workers: 4
+pin_memory: true
+
+# 预处理配置
+preprocess:
+  # 是否启用预处理
+  enabled: true
+  # 亮度调整（1.0 为原始亮度）
+  brightness: 1.0
+  # 对比度调整（1.0 为原始对比度）
+  contrast: 1.0
+  # 饱和度调整（1.0 为原始饱和度）
+  saturation: 1.0
+  # 是否启用去噪
+  denoise: false
+  # 去噪强度（仅当 denoise 为 true 时生效）
+  denoise_strength: 10
+  # 是否启用光照校正（CLAHE）
+  clahe: false
+  # CLAHE 裁剪限制
+  clahe_clip_limit: 2.0
+  # CLAPE 网格大小
+  clahe_grid_size: 8
+
+# 数据增强配置
+augmentation:
+  # 是否启用数据增强（仅训练集）
+  enabled: true
+  # 随机亮度对比度
+  random_brightness_contrast:
+    enabled: true
+    brightness_limit: 0.2
+    contrast_limit: 0.2
+    p: 0.5
+  # 色调饱和度变化
+  hue_saturation_value:
+    enabled: true
+    hue_shift_limit: 20
+    sat_shift_limit: 30
+    val_shift_limit: 20
+    p: 0.5
+  # 高斯模糊
+  gaussian_blur:
+    enabled: true
+    blur_limit: 7
+    p: 0.3
+  # 高斯噪声
+  gauss_noise:
+    enabled: true
+    var_limit: [10.0, 50.0]
+    p: 0.3
+  # 随机裁剪缩放
+  random_resized_crop:
+    enabled: true
+    scale: [0.8, 1.0]
+    ratio: [0.9, 1.1]
+    p: 0.5
+  # 随机遮挡
+  coarse_dropout:
+    enabled: true
+    max_holes: 8
+    max_height: 32
+    max_width: 32
+    min_holes: 1
+    min_height: 8
+    min_width: 8
+    p: 0.3
+  # 锐化
+  sharpen:
+    enabled: true
+    alpha: [0.2, 0.5]
+    lightness: [0.5, 1.0]
+    p: 0.3
+  # RGB 偏移
+  rgb_shift:
+    enabled: true
+    r_shift_limit: 15
+    g_shift_limit: 15
+    b_shift_limit: 15
+    p: 0.3
+  # 通道混洗
+  channel_shuffle:
+    enabled: false
+    p: 0.1

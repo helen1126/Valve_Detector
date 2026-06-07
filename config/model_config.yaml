@@ -1,0 +1,78 @@
+# 模型配置文件
+
+# 默认模型架构：resnet50 / efficientnet_b4 / convnext_base / swin_base
+model_name: convnext_base
+
+# 预训练权重
+pretrained: true
+
+# 输入通道数
+in_channels: 3
+
+# 角度范围（用于归一化）
+angle_min: 0.0
+angle_max: 80.0
+
+# 是否冻结骨干网络（微调时使用）
+freeze_backbone: false
+
+# 冻结的层数（仅当 freeze_backbone 为 true 时生效）
+freeze_layers: 0
+
+# Dropout 概率
+dropout: 0.2
+
+# 模型保存路径
+save_dir: ./weights
+
+# ONNX 导出配置
+onnx:
+  enabled: true
+  opset_version: 17
+  dynamic_axes:
+    input:
+      0: batch_size
+    output:
+      0: batch_size
+
+# 各模型详细配置
+models:
+  resnet50:
+    name: resnet50
+    backbone: torchvision
+    output_dim: 1
+
+  resnet101:
+    name: resnet101
+    backbone: torchvision
+    output_dim: 1
+
+  efficientnet_b4:
+    name: efficientnet_b4
+    backbone: timm
+    output_dim: 1
+
+  efficientnet_b5:
+    name: efficientnet_b5
+    backbone: timm
+    output_dim: 1
+
+  convnext_base:
+    name: convnext_base
+    backbone: timm
+    output_dim: 1
+
+  convnext_large:
+    name: convnext_large
+    backbone: timm
+    output_dim: 1
+
+  swin_base:
+    name: swin_base_patch4_window12_384
+    backbone: timm
+    output_dim: 1
+
+  swin_large:
+    name: swin_large_patch4_window12_384
+    backbone: timm
+    output_dim: 1

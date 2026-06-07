@@ -1,0 +1,13 @@
+name: valve_detector
+channels:
+  - pytorch
+  - nvidia
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch>=2.3.0
+  - torchvision>=0.18.0
+  - pytorch-cuda=12.1
+  - pip:
+      - -r requirements.txt
