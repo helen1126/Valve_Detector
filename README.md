@@ -162,7 +162,3 @@ Valve_Detector/
 | 模型导出 | ONNX、ONNX Runtime |
 | 可视化 | Matplotlib、TensorBoard |
 | 运行环境 | CUDA 12.1、Python 3.10 |
-
-## 许可证
-
-本项目基于 [MIT License](https://opensource.org/licenses/MIT) 开源。

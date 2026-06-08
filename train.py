@@ -69,6 +69,7 @@ class ValveRegressionModel(pl.LightningModule):
         freeze_backbone: bool = False,
         T_max: int = 50,
         eta_min: float = 1e-6,
+        warmup_epochs: int = 0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -81,16 +82,22 @@ class ValveRegressionModel(pl.LightningModule):
         self.mae_weight = mae_weight
         self.mse_weight = mse_weight
 
+        # 渐进式解冻：warmup_epochs > 0 时，前 N 个 epoch 冻结骨干
+        self.warmup_epochs = warmup_epochs
+        self._warmup_done = False  # 标记 warmup 是否已完成
+
         # 损失函数
         self.l1_loss = torch.nn.L1Loss()
         self.mse_loss = torch.nn.MSELoss()
 
         # 构建模型
+        # warmup 模式下初始冻结骨干，否则按 freeze_backbone 参数决定
+        should_freeze = freeze_backbone or (warmup_epochs > 0)
         self.model = build_model(
             model_name=model_name,
             pretrained=pretrained,
             dropout=dropout,
-            freeze_backbone=freeze_backbone,
+            freeze_backbone=should_freeze,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -103,6 +110,27 @@ class ValveRegressionModel(pl.LightningModule):
             归一化角度预测值
         """
         return self.model(x)
+
+    def _unfreeze_backbone(self) -> None:
+        """解冻骨干网络
+
+        warmup 阶段结束后调用，解冻骨干网络并降低学习率，
+        使微调过程更加稳定。
+        """
+        if self._warmup_done:
+            return
+
+        # 解冻骨干网络
+        for param in self.model.backbone.parameters():
+            param.requires_grad = True
+
+        # 降低学习率为原来的 1/10，避免解冻后梯度过大
+        optimizer = self.optimizers()
+        for pg in optimizer.param_groups:
+            pg["lr"] = self.hparams.lr * 0.1
+
+        self._warmup_done = True
+        self.print(f"[Epoch {self.current_epoch}] 骨干网络已解冻，学习率调整为 {self.hparams.lr * 0.1:.2e}")
 
     def _compute_loss(
         self, predictions: torch.Tensor, targets: torch.Tensor
@@ -141,6 +169,14 @@ class ValveRegressionModel(pl.LightningModule):
         Returns:
             损失值
         """
+        # 渐进式解冻：warmup 结束后解冻骨干网络
+        if (
+            self.warmup_epochs > 0
+            and not self._warmup_done
+            and self.current_epoch >= self.warmup_epochs
+        ):
+            self._unfreeze_backbone()
+
         images = batch["image"]
         angles = batch["angle"].unsqueeze(1)  # (B,) -> (B, 1)
 
@@ -325,6 +361,7 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="权重衰减")
     parser.add_argument("--image_size", type=int, default=384, help="图像尺寸")
     parser.add_argument("--num_workers", type=int, default=4, help="数据加载线程数")
+    parser.add_argument("--warmup_epochs", type=int, default=0, help="渐进式解冻warmup轮数（0=不使用，默认端到端训练）")
 
     # 损失函数参数
     parser.add_argument("--mae_weight", type=float, default=0.7, help="MAE 损失权重")
@@ -403,12 +440,17 @@ def main():
         freeze_backbone=model_config.get("freeze_backbone", False),
         T_max=train_config.get("scheduler", {}).get("T_max", 50),
         eta_min=train_config.get("scheduler", {}).get("eta_min", 1e-6),
+        warmup_epochs=args.warmup_epochs,
     )
 
     logger.info(f"模型: {args.model}")
     logger.info(f"视角: {args.view}")
     logger.info(f"图像尺寸: {image_size}")
     logger.info(f"批大小: {batch_size}")
+    if args.warmup_epochs > 0:
+        logger.info(f"渐进式解冻: 前 {args.warmup_epochs} 个 epoch 冻结骨干，之后解冻微调")
+    else:
+        logger.info("训练模式: 端到端训练（不冻结骨干网络）")
     logger.info(f"学习率: {args.lr}")
 
     # 回调函数

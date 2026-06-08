@@ -49,3 +49,5 @@ runs/
 # 输出结果
 output/
 results/
+
+.trae/
