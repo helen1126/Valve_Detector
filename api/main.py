@@ -111,15 +111,29 @@ async def startup_event():
         data_config = {}
 
     try:
+        # 从 checkpoint 自动检测模型名称
+        model_name = DEFAULT_MODEL_NAME
+        if os.path.exists(DEFAULT_MODEL_PATH) and DEFAULT_MODEL_PATH.endswith((".ckpt", ".pth")):
+            import torch as _torch
+            try:
+                _ckpt = _torch.load(DEFAULT_MODEL_PATH, map_location="cpu", weights_only=False)
+                if isinstance(_ckpt, dict) and "hyper_parameters" in _ckpt:
+                    _ckpt_name = _ckpt["hyper_parameters"].get("model_name")
+                    if _ckpt_name:
+                        model_name = _ckpt_name
+                del _ckpt
+            except Exception:
+                pass
+
         predictor = ValvePredictor(
             model_path=DEFAULT_MODEL_PATH,
-            model_name=DEFAULT_MODEL_NAME,
+            model_name=model_name,
             image_size=DEFAULT_IMAGE_SIZE,
             angle_min=data_config.get("angle_min", 0.0),
             angle_max=data_config.get("angle_max", 80.0),
             use_optimization=False,
         )
-        logger.info(f"模型加载成功: {DEFAULT_MODEL_PATH}")
+        logger.info(f"模型加载成功: {DEFAULT_MODEL_PATH} (模型: {model_name})")
     except Exception as e:
         logger.warning(f"模型加载失败: {e}，API 将在首次请求时尝试加载")
         predictor = None

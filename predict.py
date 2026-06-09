@@ -97,11 +97,19 @@ class ValvePredictor:
 
     def _load_pytorch_model(self) -> None:
         """加载 PyTorch 模型"""
-        model = build_model(model_name=self.model_name, pretrained=False)
-
         checkpoint = torch.load(
             self.model_path, map_location=self.device, weights_only=False
         )
+
+        # 从 checkpoint 中自动检测模型名称
+        model_name = self.model_name
+        if isinstance(checkpoint, dict) and "hyper_parameters" in checkpoint:
+            ckpt_model_name = checkpoint["hyper_parameters"].get("model_name")
+            if ckpt_model_name and ckpt_model_name != self.model_name:
+                self.model_name = ckpt_model_name
+                model_name = ckpt_model_name
+
+        model = build_model(model_name=model_name, pretrained=False)
 
         # 处理不同的权重格式
         if "state_dict" in checkpoint:
