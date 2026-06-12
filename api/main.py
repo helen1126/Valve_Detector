@@ -59,12 +59,15 @@ predictor: Optional[ValvePredictor] = None
 DEFAULT_MODEL_PATH = os.environ.get("MODEL_PATH", "./weights/last.ckpt")
 DEFAULT_MODEL_NAME = os.environ.get("MODEL_NAME", "convnext_base")
 DEFAULT_IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "384"))
+DEFAULT_SMART_CROP = os.environ.get("SMART_CROP", "true").lower() in ("true", "1", "yes")
+DEFAULT_MULTI_SCALE = os.environ.get("MULTI_SCALE", "false").lower() in ("true", "1", "yes")
 
 
 class PredictResponse(BaseModel):
     """单张图片预测响应"""
     angle: float
     time: float
+    cropped: bool = False
     image: Optional[str] = None
 
 
@@ -73,6 +76,7 @@ class BatchPredictItem(BaseModel):
     filename: str
     angle: Optional[float] = None
     time: float
+    cropped: bool = False
     error: Optional[str] = None
 
 
@@ -96,6 +100,8 @@ class InfoResponse(BaseModel):
     angle_range: str
     device: str
     optimization_enabled: bool
+    smart_crop_enabled: bool
+    multi_scale_enabled: bool
 
 
 @app.on_event("startup")
@@ -132,6 +138,8 @@ async def startup_event():
             angle_min=data_config.get("angle_min", 0.0),
             angle_max=data_config.get("angle_max", 80.0),
             use_optimization=False,
+            smart_crop=DEFAULT_SMART_CROP,
+            multi_scale=DEFAULT_MULTI_SCALE,
         )
         logger.info(f"模型加载成功: {DEFAULT_MODEL_PATH} (模型: {model_name})")
     except Exception as e:
@@ -180,39 +188,60 @@ def _encode_image(image: np.ndarray) -> str:
 async def predict(
     file: UploadFile = File(..., description="阀门图片文件"),
     return_image: bool = True,
+    smart_crop: Optional[bool] = None,
+    multi_scale: Optional[bool] = None,
 ):
     """上传单张阀门图片，返回预测角度
 
     Args:
         file: 上传的图片文件
         return_image: 是否返回标注后的图片（base64 编码）
+        smart_crop: 是否启用智能裁剪（None 使用默认配置）
+        multi_scale: 是否启用多尺度推理（None 使用默认配置）
 
     Returns:
         预测角度和处理时间
     """
     pred = _ensure_predictor()
 
+    # 临时覆盖预测模式
+    original_smart_crop = pred.smart_crop
+    original_multi_scale = pred.multi_scale
+    if smart_crop is not None:
+        pred.smart_crop = smart_crop
+    if multi_scale is not None:
+        pred.multi_scale = multi_scale
+    # 多尺度优先级高于智能裁剪
+    if pred.multi_scale:
+        pred.smart_crop = False
+
     # 检查模型热加载
     pred.check_and_reload()
 
-    # 读取图片
-    file_bytes = await file.read()
-    image = _decode_image(file_bytes)
+    try:
+        # 读取图片
+        file_bytes = await file.read()
+        image = _decode_image(file_bytes)
 
-    # 预测
-    result = pred.predict_single(image)
+        # 预测
+        result = pred.predict_single(image)
 
-    response = PredictResponse(
-        angle=result["angle"],
-        time=result["time"],
-    )
+        response = PredictResponse(
+            angle=result["angle"],
+            time=result["time"],
+            cropped=result.get("cropped", False),
+        )
 
-    # 返回标注后的图片
-    if return_image:
-        annotated = draw_angle_on_image(result["image"], result["angle"])
-        response.image = _encode_image(annotated)
+        # 返回标注后的图片
+        if return_image:
+            annotated = draw_angle_on_image(result["image"], result["angle"])
+            response.image = _encode_image(annotated)
 
-    return response
+        return response
+    finally:
+        # 恢复原始配置
+        pred.smart_crop = original_smart_crop
+        pred.multi_scale = original_multi_scale
 
 
 @app.post("/predict/batch", response_model=BatchPredictResponse, summary="批量图片预测")
@@ -241,6 +270,7 @@ async def predict_batch(
                 filename=file.filename,
                 angle=result["angle"],
                 time=result["time"],
+                cropped=result.get("cropped", False),
             ))
         except Exception as e:
             results.append(BatchPredictItem(
@@ -285,7 +315,9 @@ async def info():
         image_size=pred.image_size,
         angle_range=f"{pred.angle_min}° - {pred.angle_max}°",
         device=str(pred.device),
-        optimization_enabled=pred.optimizer is not None,
+        optimization_enabled=pred.use_optimization,
+        smart_crop_enabled=pred.smart_crop,
+        multi_scale_enabled=pred.multi_scale,
     )
 
 

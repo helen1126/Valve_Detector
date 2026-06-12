@@ -38,7 +38,8 @@ st.set_page_config(
 
 
 @st.cache_resource
-def load_predictor(model_path: str, model_name: str, image_size: int, use_optimization: bool):
+def load_predictor(model_path: str, model_name: str, image_size: int,
+                   use_optimization: bool, smart_crop: bool, multi_scale: bool):
     """加载预测器（缓存资源，避免重复加载）
 
     Args:
@@ -46,6 +47,8 @@ def load_predictor(model_path: str, model_name: str, image_size: int, use_optimi
         model_name: 模型架构名称
         image_size: 图像尺寸
         use_optimization: 是否使用图像优化
+        smart_crop: 是否启用智能裁剪
+        multi_scale: 是否启用多尺度推理
 
     Returns:
         ValvePredictor 实例
@@ -64,6 +67,8 @@ def load_predictor(model_path: str, model_name: str, image_size: int, use_optimi
         angle_min=data_config.get("angle_min", 0.0),
         angle_max=data_config.get("angle_max", 80.0),
         use_optimization=use_optimization,
+        smart_crop=smart_crop,
+        multi_scale=multi_scale,
     )
 
 
@@ -105,6 +110,19 @@ def main():
             help="启用颜色增强、边缘检测等图像优化",
         )
 
+        # 远距离优化
+        st.subheader("远距离优化")
+        smart_crop = st.checkbox(
+            "智能裁剪",
+            value=True,
+            help="远距离拍摄时自动定位阀门区域并放大，提升预测精度",
+        )
+        multi_scale = st.checkbox(
+            "多尺度推理",
+            value=False,
+            help="结合原图和裁剪图预测，精度更高但速度稍慢",
+        )
+
         # 加载模型按钮
         if st.button("🔄 加载模型", use_container_width=True):
             if os.path.exists(model_path):
@@ -112,7 +130,8 @@ def main():
                     try:
                         # 清除缓存，重新加载
                         st.cache_resource.clear()
-                        load_predictor(model_path, model_name, image_size, use_optimization)
+                        load_predictor(model_path, model_name, image_size,
+                                       use_optimization, smart_crop, multi_scale)
                         st.success("模型加载成功！")
                     except Exception as e:
                         st.error(f"模型加载失败: {e}")
@@ -160,13 +179,16 @@ def main():
                         with st.spinner("正在预测..."):
                             try:
                                 predictor = load_predictor(
-                                    model_path, model_name, image_size, use_optimization
+                                    model_path, model_name, image_size,
+                                    use_optimization, smart_crop, multi_scale
                                 )
                                 result = predictor.predict_single(image)
 
                                 # 显示预测结果
                                 st.metric("预测角度", f"{result['angle']}°")
                                 st.metric("处理时间", f"{result['time']:.4f} 秒")
+                                if result.get("cropped"):
+                                    st.info("已启用智能裁剪：检测到阀门占比较小，已自动裁剪放大")
 
                                 # 显示标注后的图片
                                 annotated = draw_angle_on_image(
@@ -202,7 +224,8 @@ def main():
                     with st.spinner("正在批量预测..."):
                         try:
                             predictor = load_predictor(
-                                model_path, model_name, image_size, use_optimization
+                                model_path, model_name, image_size,
+                                use_optimization, smart_crop, multi_scale
                             )
 
                             results = []

@@ -36,7 +36,7 @@ class ValvePredictor:
     """阀门角度预测器
 
     封装模型加载、图像预处理和角度预测功能，
-    支持单张/批量预测和模型热加载。
+    支持单张/批量预测、模型热加载、智能裁剪和多尺度推理。
 
     Args:
         model_path: 模型权重路径
@@ -47,6 +47,8 @@ class ValvePredictor:
         device: 计算设备
         use_onnx: 是否使用 ONNX 模型推理
         use_optimization: 是否使用图像优化
+        smart_crop: 是否启用智能裁剪（远距离拍摄时自动定位并放大阀门区域）
+        multi_scale: 是否启用多尺度推理（结合原图和裁剪图预测）
     """
 
     def __init__(
@@ -59,6 +61,8 @@ class ValvePredictor:
         device: Optional[str] = None,
         use_onnx: bool = False,
         use_optimization: bool = False,
+        smart_crop: bool = False,
+        multi_scale: bool = False,
     ):
         self.model_path = model_path
         self.model_name = model_name
@@ -67,6 +71,8 @@ class ValvePredictor:
         self.angle_max = angle_max
         self.use_onnx = use_onnx
         self.use_optimization = use_optimization
+        self.smart_crop = smart_crop
+        self.multi_scale = multi_scale
 
         # 设置设备
         if device is None:
@@ -74,8 +80,8 @@ class ValvePredictor:
         else:
             self.device = torch.device(device)
 
-        # 图像优化器
-        self.optimizer = ImageOptimizer() if use_optimization else None
+        # 图像优化器（智能裁剪和多尺度推理也需要）
+        self.optimizer = ImageOptimizer() if (use_optimization or smart_crop or multi_scale) else None
 
         # 预处理变换
         self.transform = get_val_transforms(image_size)
@@ -152,47 +158,92 @@ class ValvePredictor:
 
         return False
 
-    @torch.no_grad()
-    def predict_single(
-        self,
-        image: np.ndarray,
-    ) -> Dict[str, Union[float, np.ndarray]]:
-        """单张图片预测
+    def _preprocess(self, image: np.ndarray) -> torch.Tensor:
+        """图像预处理：变换并转为模型输入张量
 
         Args:
             image: BGR 格式图像
 
         Returns:
-            预测结果字典，包含预测角度和处理时间
+            模型输入张量 (1, 3, H, W)
         """
-        start_time = time.time()
-
-        # 图像优化
-        if self.optimizer is not None:
-            image = self.optimizer.optimize(image)
-
-        # 预处理
         transformed = self.transform(image=image)
         input_tensor = torch.from_numpy(
             transformed["image"].transpose(2, 0, 1)
         ).float().unsqueeze(0) / 255.0
-        input_tensor = input_tensor.to(self.device)
+        return input_tensor.to(self.device)
 
-        # 推理
+    def _inference(self, input_tensor: torch.Tensor) -> float:
+        """执行模型推理
+
+        Args:
+            input_tensor: 模型输入张量
+
+        Returns:
+            归一化角度预测值 [0, 1]
+        """
         if self.use_onnx:
             output = self.onnx_session.run(
                 None, {"input": input_tensor.cpu().numpy()}
             )[0]
-            prediction = float(output[0][0])
+            return float(output[0][0])
         else:
             output = self.model(input_tensor)
-            prediction = float(output.squeeze().cpu().numpy())
+            return float(output.squeeze().cpu().numpy())
 
-        # 反归一化
+    def _denormalize_angle(self, prediction: float) -> float:
+        """反归一化角度预测值
+
+        Args:
+            prediction: 归一化角度预测值 [0, 1]
+
+        Returns:
+            实际角度值
+        """
         angle = prediction * (self.angle_max - self.angle_min) + self.angle_min
+        return max(self.angle_min, min(self.angle_max, angle))
 
-        # 限制角度范围
-        angle = max(self.angle_min, min(self.angle_max, angle))
+    @torch.no_grad()
+    def predict_single(
+        self,
+        image: np.ndarray,
+    ) -> Dict[str, Union[float, np.ndarray, bool]]:
+        """单张图片预测
+
+        支持三种模式：
+        - 普通模式：直接对原图预测
+        - 智能裁剪模式：检测阀门区域并裁剪放大后预测
+        - 多尺度模式：同时用原图和裁剪图预测，加权融合
+
+        Args:
+            image: BGR 格式图像
+
+        Returns:
+            预测结果字典，包含预测角度、处理时间和是否裁剪
+        """
+        start_time = time.time()
+        was_cropped = False
+
+        # 图像优化（颜色/边缘增强）
+        if self.use_optimization and self.optimizer is not None:
+            image = self.optimizer.optimize(image)
+
+        if self.multi_scale and self.optimizer is not None:
+            # 多尺度推理：融合原图和裁剪图的预测结果
+            angle = self._predict_multi_scale(image)
+        elif self.smart_crop and self.optimizer is not None:
+            # 智能裁剪：远距离时自动裁剪阀门区域
+            cropped_img, was_cropped = self.optimizer.smart_crop(
+                image, target_size=self.image_size
+            )
+            input_tensor = self._preprocess(cropped_img)
+            prediction = self._inference(input_tensor)
+            angle = self._denormalize_angle(prediction)
+        else:
+            # 普通模式
+            input_tensor = self._preprocess(image)
+            prediction = self._inference(input_tensor)
+            angle = self._denormalize_angle(prediction)
 
         elapsed_time = time.time() - start_time
 
@@ -201,7 +252,50 @@ class ValvePredictor:
             "confidence": None,
             "time": round(elapsed_time, 4),
             "image": image,
+            "cropped": was_cropped,
         }
+
+    def _predict_multi_scale(self, image: np.ndarray) -> float:
+        """多尺度推理：融合原图和裁剪图的预测结果
+
+        当阀门在画面中占比较小时，裁剪图预测更准确；
+        占比较大时，原图预测更稳定。根据阀门占比自适应加权。
+
+        Args:
+            image: BGR 格式输入图像
+
+        Returns:
+            融合后的角度值
+        """
+        # 原图预测
+        input_tensor = self._preprocess(image)
+        pred_original = self._inference(input_tensor)
+
+        # 裁剪图预测
+        cropped_img, was_cropped = self.optimizer.smart_crop(
+            image, target_size=self.image_size
+        )
+
+        if not was_cropped:
+            # 阀门占比足够大，直接用原图结果
+            return self._denormalize_angle(pred_original)
+
+        input_tensor_cropped = self._preprocess(cropped_img)
+        pred_cropped = self._inference(input_tensor_cropped)
+
+        # 计算阀门占比，据此确定权重
+        bbox = self.optimizer.detect_valve_region(image, min_area_ratio=0.02)
+        if bbox is not None:
+            valve_ratio = (bbox[2] * bbox[3]) / (image.shape[0] * image.shape[1])
+            # 阀门占比越小，裁剪图权重越高
+            # 占比 2% → 裁剪权重 0.9，占比 15% → 裁剪权重 0.5
+            crop_weight = min(0.9, max(0.5, 1.0 - valve_ratio * 3.3))
+        else:
+            crop_weight = 0.7
+
+        # 加权融合
+        fused_pred = pred_original * (1 - crop_weight) + pred_cropped * crop_weight
+        return self._denormalize_angle(fused_pred)
 
     def predict_image_path(self, image_path: str) -> Dict:
         """从文件路径预测单张图片
@@ -337,6 +431,14 @@ def parse_args():
         help="启用图像优化"
     )
     parser.add_argument(
+        "--smart_crop", action="store_true",
+        help="启用智能裁剪（远距离拍摄时自动定位并放大阀门区域）"
+    )
+    parser.add_argument(
+        "--multi_scale", action="store_true",
+        help="启用多尺度推理（结合原图和裁剪图预测，精度更高）"
+    )
+    parser.add_argument(
         "--config_dir", type=str, default="./config",
         help="配置文件目录"
     )
@@ -366,6 +468,8 @@ def main():
         angle_max=data_config.get("angle_max", 80.0),
         use_onnx=args.onnx,
         use_optimization=args.optimize,
+        smart_crop=args.smart_crop,
+        multi_scale=args.multi_scale,
     )
 
     input_path = Path(args.input)
