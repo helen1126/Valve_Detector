@@ -20,6 +20,7 @@ from pathlib import Path
 
 import yaml
 import torch
+from typing import Optional
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
     EarlyStopping,
@@ -70,6 +71,7 @@ class ValveRegressionModel(pl.LightningModule):
         T_max: int = 50,
         eta_min: float = 1e-6,
         warmup_epochs: int = 0,
+        side_weight: float = 2.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -81,14 +83,15 @@ class ValveRegressionModel(pl.LightningModule):
         # 损失权重
         self.mae_weight = mae_weight
         self.mse_weight = mse_weight
+        self.side_weight = side_weight
 
         # 渐进式解冻：warmup_epochs > 0 时，前 N 个 epoch 冻结骨干
         self.warmup_epochs = warmup_epochs
         self._warmup_done = False  # 标记 warmup 是否已完成
 
-        # 损失函数
-        self.l1_loss = torch.nn.L1Loss()
-        self.mse_loss = torch.nn.MSELoss()
+        # 损失函数（reduction='none' 以支持逐样本加权）
+        self.l1_loss = torch.nn.L1Loss(reduction='none')
+        self.mse_loss = torch.nn.MSELoss(reduction='none')
 
         # 构建模型
         # warmup 模式下初始冻结骨干，否则按 freeze_backbone 参数决定
@@ -132,21 +135,49 @@ class ValveRegressionModel(pl.LightningModule):
         self._warmup_done = True
         self.print(f"[Epoch {self.current_epoch}] 骨干网络已解冻，学习率调整为 {self.hparams.lr * 0.1:.2e}")
 
-    def _compute_loss(
-        self, predictions: torch.Tensor, targets: torch.Tensor
-    ) -> torch.Tensor:
-        """计算组合损失
+    def _build_sample_weights(self, views: list) -> torch.Tensor:
+        """根据视角标签构建样本权重
+
+        side 视角样本给予更高权重，弥补其样本量少、学习难度大的问题。
 
         Args:
-            predictions: 预测值（归一化）
-            targets: 目标值（归一化）
+            views: 视角标签列表（字符串）
+
+        Returns:
+            样本权重张量 (B,)
+        """
+        weights = []
+        for v in views:
+            if v == "side":
+                weights.append(self.side_weight)
+            else:
+                weights.append(1.0)
+        return torch.tensor(weights, dtype=torch.float32, device=self.device)
+
+    def _compute_loss(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        sample_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """计算组合损失（支持逐样本加权）
+
+        Args:
+            predictions: 预测值（归一化）(B, 1)
+            targets: 目标值（归一化）(B, 1)
+            sample_weights: 逐样本权重 (B,)，None 时等权
 
         Returns:
             组合损失值
         """
-        mae = self.l1_loss(predictions, targets)
-        mse = self.mse_loss(predictions, targets)
-        return self.mae_weight * mae + self.mse_weight * mse
+        mae = self.l1_loss(predictions, targets).squeeze(1)  # (B,)
+        mse = self.mse_loss(predictions, targets).squeeze(1)  # (B,)
+        per_sample_loss = self.mae_weight * mae + self.mse_weight * mse
+
+        if sample_weights is not None:
+            per_sample_loss = per_sample_loss * sample_weights
+
+        return per_sample_loss.mean()
 
     def _denormalize(self, values: torch.Tensor) -> torch.Tensor:
         """反归一化角度值
@@ -179,12 +210,16 @@ class ValveRegressionModel(pl.LightningModule):
 
         images = batch["image"]
         angles = batch["angle"].unsqueeze(1)  # (B,) -> (B, 1)
+        views = batch["view"]  # 视角标签列表
 
         # 前向传播
         predictions = self(images)
 
-        # 计算损失
-        loss = self._compute_loss(predictions, angles)
+        # 构建视角感知的样本权重
+        sample_weights = self._build_sample_weights(views)
+
+        # 计算加权损失
+        loss = self._compute_loss(predictions, angles, sample_weights)
 
         # 计算角度空间的 MAE（用于监控）
         pred_angles = self._denormalize(predictions)
@@ -206,9 +241,13 @@ class ValveRegressionModel(pl.LightningModule):
         """
         images = batch["image"]
         angles = batch["angle"].unsqueeze(1)
+        views = batch["view"]
 
         predictions = self(images)
-        loss = self._compute_loss(predictions, angles)
+
+        # 验证时也使用视角加权，保持与训练一致
+        sample_weights = self._build_sample_weights(views)
+        loss = self._compute_loss(predictions, angles, sample_weights)
 
         pred_angles = self._denormalize(predictions)
         true_angles = self._denormalize(angles)
@@ -366,6 +405,7 @@ def parse_args():
     # 损失函数参数
     parser.add_argument("--mae_weight", type=float, default=0.7, help="MAE 损失权重")
     parser.add_argument("--mse_weight", type=float, default=0.3, help="MSE 损失权重")
+    parser.add_argument("--side_weight", type=float, default=2.0, help="side 视角样本损失权重（1.0=等权，>1 提升 side 重要性）")
 
     # 其他参数
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
@@ -441,6 +481,7 @@ def main():
         T_max=train_config.get("scheduler", {}).get("T_max", 50),
         eta_min=train_config.get("scheduler", {}).get("eta_min", 1e-6),
         warmup_epochs=args.warmup_epochs,
+        side_weight=args.side_weight,
     )
 
     logger.info(f"模型: {args.model}")
@@ -452,6 +493,8 @@ def main():
     else:
         logger.info("训练模式: 端到端训练（不冻结骨干网络）")
     logger.info(f"学习率: {args.lr}")
+    if args.side_weight != 1.0:
+        logger.info(f"视角加权: side 视角损失权重 = {args.side_weight}")
 
     # 回调函数
     callbacks = []

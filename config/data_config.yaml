@@ -57,6 +57,25 @@ preprocess:
 augmentation:
   # 是否启用数据增强（仅训练集）
   enabled: true
+  # 智能裁剪：远距离拍摄时裁剪放大阀门区域
+  smart_crop:
+    enabled: true
+    min_area_ratio: 0.15
+    padding_ratio: 0.25
+    min_padding: 20
+    p: 0.3
+  # 透视变换：模拟 side 视角的透视变形
+  perspective:
+    enabled: true
+    scale: [0.05, 0.1]
+    keep_size: true
+    p: 0.3
+  # 随机缩放：模拟不同拍摄距离
+  random_scale:
+    enabled: true
+    scale_limit: 0.3
+    interpolation: 1
+    p: 0.3
   # 随机亮度对比度
   random_brightness_contrast:
     enabled: true

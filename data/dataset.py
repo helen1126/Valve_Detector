@@ -63,11 +63,27 @@ class ValveDataset(Dataset):
                 f"未找到有效数据，请检查数据目录: {self.data_dir / self.view}"
             )
 
-    def _load_samples(self) -> List[Dict]:
-        """加载所有样本，解析文件名获取角度标签
+    def _infer_view(self, file_path: Path) -> str:
+        """从文件路径推断视角标签
+
+        Args:
+            file_path: 图片文件路径
 
         Returns:
-            样本列表，每项包含 image_path 和 angle
+            视角标签（"top" / "side" / "unknown"）
+        """
+        path_str = str(file_path).replace("\\", "/").lower()
+        if "side_view" in path_str:
+            return "side"
+        elif "top_view" in path_str:
+            return "top"
+        return "unknown"
+
+    def _load_samples(self) -> List[Dict]:
+        """加载所有样本，解析文件名获取角度标签和视角标签
+
+        Returns:
+            样本列表，每项包含 image_path、angle、view 和 filename
         """
         view_dir = self.data_dir / self.view
         if not view_dir.exists():
@@ -91,6 +107,7 @@ class ValveDataset(Dataset):
             samples.append({
                 "image_path": str(file_path),
                 "angle": angle,
+                "view": self._infer_view(file_path),
                 "filename": file_path.name,
             })
 
@@ -134,6 +151,7 @@ class ValveDataset(Dataset):
             "image": image,
             "angle": torch.tensor(normalized_angle, dtype=torch.float32),
             "raw_angle": sample["angle"],
+            "view": sample["view"],
             "filename": sample["filename"],
         }
 

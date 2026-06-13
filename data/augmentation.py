@@ -5,8 +5,54 @@
 """
 
 import albumentations as A
+from albumentations.core.transforms_interface import ImageOnlyTransform
 from albumentations.pytorch import ToTensorV2
 from typing import Optional
+
+import numpy as np
+
+
+class ValveSmartCrop(ImageOnlyTransform):
+    """训练时智能裁剪：以一定概率裁剪并放大阀门区域
+
+    让模型在训练时也能见到裁剪放大后的图像，
+    减少训练-推理的分布不一致问题。
+    """
+
+    def __init__(
+        self,
+        min_area_ratio: float = 0.15,
+        padding_ratio: float = 0.25,
+        min_padding: int = 20,
+        always_apply: bool = False,
+        p: float = 0.3,
+    ):
+        super().__init__(always_apply=always_apply, p=p)
+        self.min_area_ratio = min_area_ratio
+        self.padding_ratio = padding_ratio
+        self.min_padding = min_padding
+        self._optimizer = None  # 延迟初始化，避免 import 循环
+
+    def _get_optimizer(self):
+        """延迟初始化 ImageOptimizer"""
+        if self._optimizer is None:
+            from utils.image_optimization import ImageOptimizer
+            self._optimizer = ImageOptimizer()
+        return self._optimizer
+
+    def apply(self, img: np.ndarray, **params) -> np.ndarray:
+        """执行智能裁剪"""
+        optimizer = self._get_optimizer()
+        cropped, was_cropped = optimizer.smart_crop(
+            img,
+            min_area_ratio=self.min_area_ratio,
+            padding_ratio=self.padding_ratio,
+            min_padding=self.min_padding,
+        )
+        return cropped
+
+    def get_transform_init_args_names(self):
+        return ("min_area_ratio", "padding_ratio", "min_padding")
 
 
 def get_train_transforms(
@@ -24,6 +70,18 @@ def get_train_transforms(
     """
     transforms_list = []
 
+    # 智能裁剪：以一定概率裁剪并放大阀门区域，模拟远距离拍摄
+    if config is not None and config.get("smart_crop", {}).get("enabled", True):
+        crop_config = config.get("smart_crop", {})
+        transforms_list.append(
+            ValveSmartCrop(
+                min_area_ratio=crop_config.get("min_area_ratio", 0.15),
+                padding_ratio=crop_config.get("padding_ratio", 0.25),
+                min_padding=crop_config.get("min_padding", 20),
+                p=crop_config.get("p", 0.3),
+            )
+        )
+
     # 随机裁剪缩放
     if config is None or config.get("random_resized_crop", {}).get("enabled", True):
         crop_config = (config or {}).get("random_resized_crop", {})
@@ -38,6 +96,28 @@ def get_train_transforms(
     else:
         transforms_list.append(
             A.Resize(height=image_size, width=image_size)
+        )
+
+    # 透视变换：模拟 side 视角的透视变形
+    if config is None or config.get("perspective", {}).get("enabled", True):
+        persp_config = (config or {}).get("perspective", {})
+        transforms_list.append(
+            A.Perspective(
+                scale=tuple(persp_config.get("scale", [0.05, 0.1])),
+                keep_size=persp_config.get("keep_size", True),
+                p=persp_config.get("p", 0.3),
+            )
+        )
+
+    # 随机缩放：模拟不同拍摄距离
+    if config is None or config.get("random_scale", {}).get("enabled", True):
+        scale_config = (config or {}).get("random_scale", {})
+        transforms_list.append(
+            A.RandomScale(
+                scale_limit=scale_config.get("scale_limit", 0.3),
+                interpolation=scale_config.get("interpolation", 1),
+                p=scale_config.get("p", 0.3),
+            )
         )
 
     # 随机亮度对比度
