@@ -400,6 +400,119 @@ class ValvePredictor:
 
         return df
 
+    def predict_video(
+        self,
+        video_path: str,
+        output_dir: Optional[str] = None,
+        fps: Optional[float] = None,
+        frame_interval: Optional[int] = None,
+        save_frames: bool = False,
+        save_video: bool = False,
+    ) -> pd.DataFrame:
+        """视频抽帧预测
+
+        按指定频率从视频中抽帧并预测阀门角度。支持两种抽帧方式：
+        - fps：每秒抽取多少帧（如 2.0 = 每秒 2 帧）
+        - frame_interval：每隔多少帧抽取一帧（如 30 = 每 30 帧抽 1 帧）
+
+        Args:
+            video_path: 视频文件路径
+            output_dir: 结果输出目录（可选）
+            fps: 每秒抽帧数，与 frame_interval 二选一
+            frame_interval: 帧间隔，与 fps 二选一
+            save_frames: 是否保存标注帧为图片
+            save_video: 是否输出带角度标注的视频
+
+        Returns:
+            预测结果 DataFrame，包含帧索引、时间戳、预测角度、处理时间
+        """
+        import cv2
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"无法打开视频文件: {video_path}")
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_fps = cap.get(cv2.CAP_PROP_FPS)
+        if video_fps <= 0:
+            video_fps = 25.0  # 默认假设 25fps
+
+        # 计算抽帧间隔
+        if fps is not None and fps > 0:
+            interval = max(1, int(video_fps / fps))
+        elif frame_interval is not None and frame_interval > 0:
+            interval = frame_interval
+        else:
+            # 默认每秒 1 帧
+            interval = max(1, int(video_fps))
+
+        # 准备输出
+        if output_dir is not None:
+            output_path = Path(output_dir)
+            output_path.mkdir(parents=True, exist_ok=True)
+        else:
+            output_path = None
+
+        # 视频写入器（可选）
+        video_writer = None
+        if save_video and output_path is not None:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            video_out_path = str(output_path / "predicted_video.mp4")
+            video_writer = cv2.VideoWriter(video_out_path, fourcc, video_fps, (frame_w, frame_h))
+
+        results = []
+        frame_idx = 0
+        processed_count = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_idx % interval == 0:
+                # 预测
+                result = self.predict_single(frame)
+                angle = result["angle"]
+                timestamp = frame_idx / video_fps
+
+                results.append({
+                    "帧索引": frame_idx,
+                    "时间戳(秒)": round(timestamp, 2),
+                    "预测角度": angle,
+                    "处理时间(秒)": result["time"],
+                })
+
+                # 保存标注帧
+                if save_frames and output_path is not None:
+                    annotated = draw_angle_on_image(frame, angle)
+                    frame_name = f"frame_{frame_idx:06d}_{angle:.1f}.jpg"
+                    save_image(annotated, str(output_path / frame_name))
+
+                # 写入标注视频
+                if video_writer is not None:
+                    annotated = draw_angle_on_image(frame, angle)
+                    video_writer.write(annotated)
+
+                processed_count += 1
+
+            frame_idx += 1
+
+        cap.release()
+        if video_writer is not None:
+            video_writer.release()
+
+        # 转换为 DataFrame
+        df = pd.DataFrame(results)
+
+        # 保存 CSV
+        if output_path is not None and len(df) > 0:
+            csv_path = output_path / "video_predictions.csv"
+            df.to_csv(str(csv_path), index=False, encoding="utf-8-sig")
+
+        return df
+
 
 def parse_args():
     """解析命令行参数"""
@@ -443,6 +556,24 @@ def parse_args():
         help="配置文件目录"
     )
 
+    # 视频抽帧参数
+    parser.add_argument(
+        "--fps", type=float, default=None,
+        help="视频抽帧频率：每秒抽取多少帧（与 --frame_interval 二选一）"
+    )
+    parser.add_argument(
+        "--frame_interval", type=int, default=None,
+        help="视频抽帧间隔：每隔多少帧抽取一帧（与 --fps 二选一）"
+    )
+    parser.add_argument(
+        "--save_frames", action="store_true",
+        help="视频预测时保存标注帧为图片"
+    )
+    parser.add_argument(
+        "--save_video", action="store_true",
+        help="视频预测时输出带角度标注的视频"
+    )
+
     return parser.parse_args()
 
 
@@ -474,7 +605,37 @@ def main():
 
     input_path = Path(args.input)
 
-    if input_path.is_file():
+    # 视频文件后缀
+    video_extensions = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv"}
+
+    if input_path.is_file() and input_path.suffix.lower() in video_extensions:
+        # 视频抽帧预测
+        logger.info(f"视频抽帧预测: {input_path}")
+        if args.fps is not None:
+            logger.info(f"抽帧频率: {args.fps} fps")
+        elif args.frame_interval is not None:
+            logger.info(f"抽帧间隔: 每 {args.frame_interval} 帧")
+        else:
+            logger.info("抽帧频率: 默认每秒 1 帧")
+
+        df = predictor.predict_video(
+            video_path=str(input_path),
+            output_dir=args.output,
+            fps=args.fps,
+            frame_interval=args.frame_interval,
+            save_frames=args.save_frames,
+            save_video=args.save_video,
+        )
+
+        logger.info(f"视频预测完成，共处理 {len(df)} 帧")
+        if len(df) > 0:
+            logger.info(f"结果已保存: {Path(args.output) / 'video_predictions.csv'}")
+            logger.info(f"平均预测角度: {df['预测角度'].mean():.1f}°")
+            logger.info(f"预测角度范围: {df['预测角度'].min():.1f}° - {df['预测角度'].max():.1f}°")
+            if args.save_video:
+                logger.info(f"标注视频已保存: {Path(args.output) / 'predicted_video.mp4'}")
+
+    elif input_path.is_file():
         # 单张图片预测
         result = predictor.predict_image_path(str(input_path))
         logger.info(f"预测角度: {result['angle']}°")

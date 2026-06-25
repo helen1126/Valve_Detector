@@ -1,12 +1,14 @@
 # API 文档
 
-阀门角度检测系统 RESTful API 接口文档。API 基于 FastAPI 构建，提供单张/批量预测、健康检查和模型信息查询功能。
+阀门角度检测系统 RESTful API 接口文档。API 基于 FastAPI 构建，提供单张/批量/视频预测、健康检查和模型信息查询功能。
 
 **基础信息**：
 
-- 基础 URL：`http://localhost:8000`
-- 交互式文档：http://localhost:8000/docs （Swagger UI）
-- 备选文档：http://localhost:8000/redoc （ReDoc）
+- 基础 URL：`http://localhost:8000`（HTTP 模式）或 `https://localhost:8443`（HTTPS 模式）
+- 交互式文档：HTTP 模式 http://localhost:8000/docs ，HTTPS 模式 https://localhost:8443/docs （Swagger UI）
+- 备选文档：HTTP 模式 http://localhost:8000/redoc ，HTTPS 模式 https://localhost:8443/redoc （ReDoc）
+
+> **HTTPS 模式**：配置 `SSL_KEYFILE` 和 `SSL_CERTFILE` 环境变量后，API 以 HTTPS 模式运行，详见[部署指南](部署指南.md#https-部署)。
 
 ## 接口列表
 
@@ -14,6 +16,7 @@
 |------|------|------|
 | POST | `/predict` | 单张图片预测 |
 | POST | `/predict/batch` | 批量图片预测 |
+| POST | `/predict/video` | 视频抽帧预测 |
 | GET | `/health` | 健康检查 |
 | GET | `/info` | 模型信息查询 |
 
@@ -31,6 +34,10 @@
 |------|------|------|------|
 | `file` | File | 是 | 阀门图片文件（支持 jpg/jpeg/png/bmp） |
 | `return_image` | bool | 否 | 是否返回标注后的图片（base64 编码），默认 `true` |
+| `smart_crop` | bool | 否 | 是否启用智能裁剪（远距离拍摄时自动定位并放大阀门区域），默认为服务配置值 |
+| `multi_scale` | bool | 否 | 是否启用多尺度推理（结合原图和裁剪图预测，精度更高），默认为服务配置值 |
+
+> **注意**：`multi_scale` 优先级高于 `smart_crop`，同时启用时使用多尺度推理。
 
 ### 响应
 
@@ -172,6 +179,98 @@ curl -X POST "http://localhost:8000/predict/batch" \
 
 ---
 
+## POST /predict/video
+
+上传视频文件，按指定频率抽帧并预测阀门角度。支持两种抽帧方式：按每秒帧数（fps）或按帧间隔（frame_interval）。
+
+### 请求
+
+- **Content-Type**：`multipart/form-data`
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `file` | File | 是 | 视频文件（支持 mp4/avi/mov/mkv） |
+| `fps` | float | 否 | 每秒抽帧数（如 2.0 = 每秒 2 帧），与 `frame_interval` 二选一 |
+| `frame_interval` | int | 否 | 帧间隔（如 30 = 每 30 帧抽 1 帧），与 `fps` 二选一 |
+
+> **注意**：`fps` 和 `frame_interval` 都不指定时，默认每秒抽 1 帧。
+
+### 响应
+
+**成功响应**（200）：
+
+```json
+{
+  "total_frames": 60,
+  "processed_frames": 60,
+  "total_time": 12.3456,
+  "results": [
+    {
+      "frame_idx": 0,
+      "timestamp": 0.0,
+      "angle": 25.3,
+      "time": 0.0452
+    },
+    {
+      "frame_idx": 30,
+      "timestamp": 1.0,
+      "angle": 26.1,
+      "time": 0.0431
+    }
+  ]
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `total_frames` | int | 处理的总帧数 |
+| `processed_frames` | int | 实际预测的帧数 |
+| `total_time` | float | 总处理耗时（秒） |
+| `results` | array | 预测结果列表 |
+| `results[].frame_idx` | int | 帧索引（在原视频中的位置） |
+| `results[].timestamp` | float | 时间戳（秒） |
+| `results[].angle` | float | 预测角度（°），范围 0.0~80.0 |
+| `results[].time` | float | 单帧处理耗时（秒） |
+
+### 调用示例
+
+**Python requests**：
+
+```python
+import requests
+
+url = "http://localhost:8000/predict/video"
+
+# 按每秒 2 帧抽帧
+with open("valve_video.mp4", "rb") as f:
+    response = requests.post(url, files={"file": f}, params={"fps": 2})
+
+result = response.json()
+print(f"总帧数: {result['total_frames']}")
+print(f"总耗时: {result['total_time']}秒")
+
+for item in result["results"]:
+    print(f"  帧 {item['frame_idx']} ({item['timestamp']:.1f}s): {item['angle']}°")
+
+# 按帧间隔抽帧（每 30 帧抽 1 帧）
+with open("valve_video.mp4", "rb") as f:
+    response = requests.post(url, files={"file": f}, params={"frame_interval": 30})
+```
+
+**curl**：
+
+```bash
+# 按每秒 2 帧抽帧
+curl -X POST "http://localhost:8000/predict/video?fps=2" \
+  -F "file=@valve_video.mp4"
+
+# 按帧间隔抽帧
+curl -X POST "http://localhost:8000/predict/video?frame_interval=30" \
+  -F "file=@valve_video.mp4"
+```
+
+---
+
 ## GET /health
 
 检查服务健康状态。
@@ -235,7 +334,9 @@ curl http://localhost:8000/health
   "image_size": 384,
   "angle_range": "0.0° - 80.0°",
   "device": "cuda:0",
-  "optimization_enabled": false
+  "optimization_enabled": false,
+  "smart_crop_enabled": true,
+  "multi_scale_enabled": false
 }
 ```
 
@@ -247,6 +348,8 @@ curl http://localhost:8000/health
 | `angle_range` | string | 角度检测范围 |
 | `device` | string | 计算设备（如 `cuda:0` 或 `cpu`） |
 | `optimization_enabled` | bool | 是否启用图像优化 |
+| `smart_crop_enabled` | bool | 是否启用智能裁剪（远距离优化） |
+| `multi_scale_enabled` | bool | 是否启用多尺度推理 |
 
 ### 调用示例
 
@@ -358,6 +461,17 @@ files = [
 batch_result = requests.post(f"{BASE_URL}/predict/batch", files=files).json()
 for item in batch_result["results"]:
     print(f"  {item['filename']}: {item['angle']}°")
+
+# 5. 视频抽帧预测（按每秒 2 帧抽帧）
+with open("valve_video.mp4", "rb") as f:
+    video_result = requests.post(
+        f"{BASE_URL}/predict/video",
+        files={"file": f},
+        params={"fps": 2}
+    ).json()
+print(f"视频总帧数: {video_result['total_frames']}, 总耗时: {video_result['total_time']}秒")
+for item in video_result["results"]:
+    print(f"  帧 {item['frame_idx']} ({item['timestamp']:.1f}s): {item['angle']}°")
 ```
 
 ### curl 完整示例

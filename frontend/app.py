@@ -142,7 +142,7 @@ def main():
         st.info("💡 提示：首次使用请先加载模型，然后上传图片进行预测。")
 
     # 主界面
-    tab1, tab2 = st.tabs(["📷 单张预测", "📁 批量预测"])
+    tab1, tab2, tab3 = st.tabs(["📷 单张预测", "📁 批量预测", "🎬 视频预测"])
 
     # ===== 单张预测 =====
     with tab1:
@@ -279,6 +279,131 @@ def main():
 
                         except Exception as e:
                             st.error(f"批量预测失败: {e}")
+
+    # ===== 视频预测 =====
+    with tab3:
+        st.subheader("视频抽帧预测")
+
+        uploaded_video = st.file_uploader(
+            "上传视频文件",
+            type=["mp4", "avi", "mov", "mkv"],
+            key="video_upload",
+        )
+
+        if uploaded_video is not None:
+            # 抽帧方式选择
+            sample_mode = st.radio(
+                "抽帧方式",
+                options=["按每秒帧数 (fps)", "按帧间隔"],
+                horizontal=True,
+            )
+
+            col_fps, col_out = st.columns(2)
+            with col_fps:
+                if sample_mode == "按每秒帧数 (fps)":
+                    fps = st.number_input(
+                        "每秒抽帧数",
+                        min_value=0.5,
+                        max_value=10.0,
+                        value=1.0,
+                        step=0.5,
+                        help="每秒从视频中抽取多少帧",
+                    )
+                    frame_interval = None
+                else:
+                    frame_interval = st.number_input(
+                        "帧间隔",
+                        min_value=1,
+                        max_value=300,
+                        value=30,
+                        step=1,
+                        help="每隔多少帧抽取一帧",
+                    )
+                    fps = None
+
+            with col_out:
+                save_frames = st.checkbox("保存标注帧为图片", value=False)
+                save_video = st.checkbox("输出标注视频", value=False)
+
+            if st.button("开始视频预测", type="primary"):
+                if predictor is None:
+                    st.error("请先在侧边栏加载模型")
+                else:
+                    try:
+                        import tempfile
+                        import os as _os
+
+                        # 保存上传的视频到临时文件
+                        suffix = _os.path.splitext(uploaded_video.name)[1] or ".mp4"
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                            tmp.write(uploaded_video.read())
+                            tmp_path = tmp.name
+
+                        try:
+                            with st.spinner("正在处理视频..."):
+                                # 输出目录
+                                output_dir = "./output/video"
+                                _os.makedirs(output_dir, exist_ok=True)
+
+                                df = predictor.predict_video(
+                                    video_path=tmp_path,
+                                    output_dir=output_dir,
+                                    fps=fps,
+                                    frame_interval=frame_interval,
+                                    save_frames=save_frames,
+                                    save_video=save_video,
+                                )
+
+                            if len(df) > 0:
+                                st.success(f"视频预测完成，共处理 {len(df)} 帧")
+
+                                # 统计指标
+                                col1, col2, col3, col4 = st.columns(4)
+                                with col1:
+                                    st.metric("总帧数", len(df))
+                                with col2:
+                                    st.metric("平均角度", f"{df['预测角度'].mean():.1f}°")
+                                with col3:
+                                    st.metric("最小角度", f"{df['预测角度'].min():.1f}°")
+                                with col4:
+                                    st.metric("最大角度", f"{df['预测角度'].max():.1f}°")
+
+                                # 角度随时间变化折线图
+                                st.subheader("角度变化趋势")
+                                chart_data = df.set_index("时间戳(秒)")[["预测角度"]]
+                                st.line_chart(chart_data)
+
+                                # 结果表格
+                                st.subheader("预测结果")
+                                st.dataframe(df, use_container_width=True)
+
+                                # CSV 下载
+                                csv = df.to_csv(index=False, encoding="utf-8-sig")
+                                st.download_button(
+                                    "📥 下载预测结果 (CSV)",
+                                    data=csv,
+                                    file_name="video_predictions.csv",
+                                    mime="text/csv",
+                                )
+
+                                if save_video:
+                                    video_path = _os.path.join(output_dir, "predicted_video.mp4")
+                                    if _os.path.exists(video_path):
+                                        with open(video_path, "rb") as f:
+                                            st.download_button(
+                                                "📥 下载标注视频",
+                                                data=f.read(),
+                                                file_name="predicted_video.mp4",
+                                                mime="video/mp4",
+                                            )
+                            else:
+                                st.warning("未提取到任何帧，请检查视频文件")
+
+                        finally:
+                            _os.unlink(tmp_path)
+
+                    except Exception as e:
+                        st.error(f"视频预测失败: {e}")
 
 
 if __name__ == "__main__":

@@ -58,12 +58,14 @@ class ValveSmartCrop(ImageOnlyTransform):
 def get_train_transforms(
     image_size: int = 384,
     config: Optional[dict] = None,
+    is_side: bool = False,
 ) -> A.Compose:
     """获取训练集数据增强流水线
 
     Args:
         image_size: 目标图像尺寸
         config: 数据增强配置字典（来自 data_config.yaml）
+        is_side: 是否为 side 视角样本（side 使用更强的畸变增强）
 
     Returns:
         Albumentations 增强流水线
@@ -101,11 +103,30 @@ def get_train_transforms(
     # 透视变换：模拟 side 视角的透视变形
     if config is None or config.get("perspective", {}).get("enabled", True):
         persp_config = (config or {}).get("perspective", {})
+        persp_p = persp_config.get("p", 0.3)
+        if is_side:
+            persp_p = min(persp_p * 2, 0.8)
         transforms_list.append(
             A.Perspective(
-                scale=tuple(persp_config.get("scale", [0.05, 0.1])),
+                scale=tuple(persp_config.get("scale", [0.08, 0.15])),
                 keep_size=persp_config.get("keep_size", True),
-                p=persp_config.get("p", 0.3),
+                p=persp_p,
+            )
+        )
+
+    # 镜头畸变：模拟 side 视角的桶形/枕形畸变
+    if config is None or config.get("optical_distortion", {}).get("enabled", True):
+        distort_config = (config or {}).get("optical_distortion", {})
+        distort_p = distort_config.get("p", 0.4)
+        if is_side:
+            distort_p = min(distort_p * 2, 0.8)
+        transforms_list.append(
+            A.OpticalDistortion(
+                distort_limit=tuple(distort_config.get("distort_limit", [-0.3, 0.3])),
+                shift_limit=tuple(distort_config.get("shift_limit", [-0.1, 0.1])),
+                interpolation=distort_config.get("interpolation", 1),
+                border_mode=distort_config.get("border_mode", 0),
+                p=distort_p,
             )
         )
 
@@ -114,7 +135,7 @@ def get_train_transforms(
         scale_config = (config or {}).get("random_scale", {})
         transforms_list.append(
             A.RandomScale(
-                scale_limit=scale_config.get("scale_limit", 0.3),
+                scale_limit=scale_config.get("scale_limit", 0.5),
                 interpolation=scale_config.get("interpolation", 1),
                 p=scale_config.get("p", 0.3),
             )
@@ -241,14 +262,16 @@ def get_transforms_from_config(
         image_size: 目标图像尺寸
 
     Returns:
-        (train_transforms, val_transforms) 元组
+        (train_transforms, train_transforms_side, val_transforms) 元组
     """
     aug_config = config.get("augmentation", {})
     if aug_config.get("enabled", True):
-        train_transforms = get_train_transforms(image_size, aug_config)
+        train_transforms = get_train_transforms(image_size, aug_config, is_side=False)
+        train_transforms_side = get_train_transforms(image_size, aug_config, is_side=True)
     else:
         train_transforms = get_val_transforms(image_size)
+        train_transforms_side = get_val_transforms(image_size)
 
     val_transforms = get_val_transforms(image_size)
 
-    return train_transforms, val_transforms
+    return train_transforms, train_transforms_side, val_transforms

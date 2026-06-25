@@ -50,4 +50,10 @@ runs/
 output/
 results/
 
+# SSL 证书
+certs/
+*.pem
+*.crt
+*.key
+
 .trae/

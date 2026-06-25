@@ -14,6 +14,7 @@ import base64
 import io
 import os
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Optional
 
@@ -21,7 +22,7 @@ import cv2
 import numpy as np
 import uvicorn
 import yaml
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -34,27 +35,6 @@ from utils.logger import setup_logger, get_logger
 setup_logger(log_dir="./logs")
 logger = get_logger()
 
-# 创建 FastAPI 应用
-app = FastAPI(
-    title="阀门角度检测 API",
-    description="工业阀门角度检测系统 RESTful API 接口",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
-
-# CORS 中间件
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# 全局预测器实例
-predictor: Optional[ValvePredictor] = None
-
 # 配置
 DEFAULT_MODEL_PATH = os.environ.get("MODEL_PATH", "./weights/last.ckpt")
 DEFAULT_MODEL_NAME = os.environ.get("MODEL_NAME", "convnext_base")
@@ -63,50 +43,9 @@ DEFAULT_SMART_CROP = os.environ.get("SMART_CROP", "true").lower() in ("true", "1
 DEFAULT_MULTI_SCALE = os.environ.get("MULTI_SCALE", "false").lower() in ("true", "1", "yes")
 
 
-class PredictResponse(BaseModel):
-    """单张图片预测响应"""
-    angle: float
-    time: float
-    cropped: bool = False
-    image: Optional[str] = None
-
-
-class BatchPredictItem(BaseModel):
-    """批量预测单项结果"""
-    filename: str
-    angle: Optional[float] = None
-    time: float
-    cropped: bool = False
-    error: Optional[str] = None
-
-
-class BatchPredictResponse(BaseModel):
-    """批量预测响应"""
-    results: List[BatchPredictItem]
-    total_time: float
-
-
-class HealthResponse(BaseModel):
-    """健康检查响应"""
-    status: str
-    model_loaded: bool
-
-
-class InfoResponse(BaseModel):
-    """模型信息响应"""
-    model_name: str
-    model_path: str
-    image_size: int
-    angle_range: str
-    device: str
-    optimization_enabled: bool
-    smart_crop_enabled: bool
-    multi_scale_enabled: bool
-
-
-@app.on_event("startup")
-async def startup_event():
-    """应用启动时初始化模型"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理：启动时加载模型，关闭时清理资源"""
     global predictor
 
     config_path = "./config/data_config.yaml"
@@ -145,6 +84,92 @@ async def startup_event():
     except Exception as e:
         logger.warning(f"模型加载失败: {e}，API 将在首次请求时尝试加载")
         predictor = None
+
+    yield
+
+    # 清理资源
+    if predictor is not None:
+        logger.info("模型资源已释放")
+
+
+# 创建 FastAPI 应用
+app = FastAPI(
+    title="阀门角度检测 API",
+    description="工业阀门角度检测系统 RESTful API 接口",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    lifespan=lifespan,
+)
+
+# CORS 中间件
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 全局预测器实例
+predictor: Optional[ValvePredictor] = None
+
+
+class PredictResponse(BaseModel):
+    """单张图片预测响应"""
+    angle: float
+    time: float
+    cropped: bool = False
+    image: Optional[str] = None
+
+
+class BatchPredictItem(BaseModel):
+    """批量预测单项结果"""
+    filename: str
+    angle: Optional[float] = None
+    time: float
+    cropped: bool = False
+    error: Optional[str] = None
+
+
+class BatchPredictResponse(BaseModel):
+    """批量预测响应"""
+    results: List[BatchPredictItem]
+    total_time: float
+
+
+class VideoFrameResult(BaseModel):
+    """视频抽帧预测单项结果"""
+    frame_idx: int
+    timestamp: float
+    angle: float
+    time: float
+
+
+class VideoPredictResponse(BaseModel):
+    """视频抽帧预测响应"""
+    total_frames: int
+    processed_frames: int
+    total_time: float
+    results: List[VideoFrameResult]
+
+
+class HealthResponse(BaseModel):
+    """健康检查响应"""
+    status: str
+    model_loaded: bool
+
+
+class InfoResponse(BaseModel):
+    """模型信息响应"""
+    model_name: str
+    model_path: str
+    image_size: int
+    angle_range: str
+    device: str
+    optimization_enabled: bool
+    smart_crop_enabled: bool
+    multi_scale_enabled: bool
 
 
 def _ensure_predictor():
@@ -287,6 +312,66 @@ async def predict_batch(
     )
 
 
+@app.post("/predict/video", response_model=VideoPredictResponse, summary="视频抽帧预测")
+async def predict_video(
+    file: UploadFile = File(..., description="视频文件（mp4/avi/mov/mkv）"),
+    fps: Optional[float] = Query(None, description="每秒抽帧数（与 frame_interval 二选一）"),
+    frame_interval: Optional[int] = Query(None, description="帧间隔（与 fps 二选一）"),
+):
+    """上传视频文件，按指定频率抽帧并预测阀门角度
+
+    Args:
+        file: 上传的视频文件
+        fps: 每秒抽帧数（如 2.0 = 每秒 2 帧）
+        frame_interval: 帧间隔（如 30 = 每 30 帧抽 1 帧）
+
+    Returns:
+        每帧的预测结果列表
+    """
+    pred = _ensure_predictor()
+
+    # 保存上传的视频到临时文件
+    import tempfile
+    import os as _os
+
+    file_bytes = await file.read()
+    suffix = _os.path.splitext(file.filename or "video.mp4")[1] or ".mp4"
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+
+    try:
+        start_time = time.time()
+        df = pred.predict_video(
+            video_path=tmp_path,
+            output_dir=None,
+            fps=fps,
+            frame_interval=frame_interval,
+            save_frames=False,
+            save_video=False,
+        )
+        total_time = time.time() - start_time
+
+        results = []
+        for _, row in df.iterrows():
+            results.append(VideoFrameResult(
+                frame_idx=int(row["帧索引"]),
+                timestamp=float(row["时间戳(秒)"]),
+                angle=float(row["预测角度"]),
+                time=float(row["处理时间(秒)"]),
+            ))
+
+        return VideoPredictResponse(
+            total_frames=len(df),
+            processed_frames=len(df),
+            total_time=round(total_time, 4),
+            results=results,
+        )
+    finally:
+        _os.unlink(tmp_path)
+
+
 @app.get("/health", response_model=HealthResponse, summary="健康检查")
 async def health():
     """检查服务健康状态
@@ -332,9 +417,40 @@ async def global_exception_handler(request, exc):
 
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "api.main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-    )
+    import asyncio
+
+    ssl_keyfile = os.environ.get("SSL_KEYFILE")
+    ssl_certfile = os.environ.get("SSL_CERTFILE")
+    https_port = int(os.environ.get("HTTPS_PORT", "8443"))
+    http_port = int(os.environ.get("HTTP_PORT", "8000"))
+
+    if ssl_keyfile and ssl_certfile:
+        # 同时启动 HTTPS 和 HTTP 两个 API 服务（均提供完整接口，不重定向）
+        async def serve_dual():
+            https_config = uvicorn.Config(
+                "api.main:app",
+                host="0.0.0.0",
+                port=https_port,
+                ssl_keyfile=ssl_keyfile,
+                ssl_certfile=ssl_certfile,
+            )
+            http_config = uvicorn.Config(
+                "api.main:app",
+                host="0.0.0.0",
+                port=http_port,
+            )
+            https_server = uvicorn.Server(https_config)
+            http_server = uvicorn.Server(http_config)
+            await asyncio.gather(https_server.serve(), http_server.serve())
+
+        logger.info(f"HTTPS 服务启动: https://0.0.0.0:{https_port}")
+        logger.info(f"HTTP 服务启动: http://0.0.0.0:{http_port}")
+        asyncio.run(serve_dual())
+    else:
+        # HTTP 模式（向后兼容）
+        uvicorn.run(
+            "api.main:app",
+            host="0.0.0.0",
+            port=http_port,
+            reload=True,
+        )

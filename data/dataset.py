@@ -43,18 +43,22 @@ class ValveDataset(Dataset):
         view: str = "all_view",
         image_size: int = 384,
         transform=None,
+        transform_side=None,
         angle_min: float = 0.0,
         angle_max: float = 80.0,
         extensions: Optional[List[str]] = None,
+        oversample_side: bool = True,
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
         self.view = view
         self.image_size = image_size
         self.transform = transform
+        self.transform_side = transform_side  # side 视角专用增强（更强畸变）
         self.angle_min = angle_min
         self.angle_max = angle_max
         self.extensions = extensions or [".jpg", ".jpeg", ".png", ".bmp"]
+        self.oversample_side = oversample_side
 
         # 加载数据
         self.samples = self._load_samples()
@@ -111,6 +115,18 @@ class ValveDataset(Dataset):
                 "filename": file_path.name,
             })
 
+        # side 样本过采样：重复 side 样本使数量接近 top 样本
+        if self.oversample_side and self.view == "all_view":
+            side_samples = [s for s in samples if s["view"] == "side"]
+            top_samples = [s for s in samples if s["view"] == "top"]
+            if side_samples and top_samples:
+                n_top = len(top_samples)
+                n_side = len(side_samples)
+                # 计算需要重复的次数（向上取整）
+                repeat = max(1, (n_top + n_side - 1) // n_side) - 1
+                if repeat > 0:
+                    samples = samples + side_samples * repeat
+
         return samples
 
     def __len__(self) -> int:
@@ -133,9 +149,14 @@ class ValveDataset(Dataset):
         # 调整尺寸
         image = self._resize_image(image, self.image_size)
 
+        # 根据视角选择增强流水线：side 使用更强的畸变增强
+        transform = self.transform
+        if sample["view"] == "side" and self.transform_side is not None:
+            transform = self.transform_side
+
         # 应用数据增强/预处理
-        if self.transform is not None:
-            transformed = self.transform(image=image)
+        if transform is not None:
+            transformed = transform(image=image)
             image = transformed["image"]
 
         # 转换为张量 (H, W, C) -> (C, H, W)，归一化到 [0, 1]
@@ -281,6 +302,7 @@ class ValveDataModule(LightningDataModule):
         test_ratio: float = 0.1,
         seed: int = 42,
         train_transform=None,
+        train_transform_side=None,
         val_transform=None,
         angle_min: float = 0.0,
         angle_max: float = 80.0,
@@ -298,6 +320,7 @@ class ValveDataModule(LightningDataModule):
         self.test_ratio = test_ratio
         self.seed = seed
         self.train_transform = train_transform
+        self.train_transform_side = train_transform_side
         self.val_transform = val_transform
         self.angle_min = angle_min
         self.angle_max = angle_max
@@ -337,6 +360,7 @@ class ValveDataModule(LightningDataModule):
                 view=self.view,
                 image_size=self.image_size,
                 transform=self.train_transform,
+                transform_side=self.train_transform_side,
                 angle_min=self.angle_min,
                 angle_max=self.angle_max,
             )

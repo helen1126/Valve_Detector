@@ -71,7 +71,8 @@ class ValveRegressionModel(pl.LightningModule):
         T_max: int = 50,
         eta_min: float = 1e-6,
         warmup_epochs: int = 0,
-        side_weight: float = 2.0,
+        side_weight: float = 5.0,
+        focal_gamma: float = 2.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -84,6 +85,7 @@ class ValveRegressionModel(pl.LightningModule):
         self.mae_weight = mae_weight
         self.mse_weight = mse_weight
         self.side_weight = side_weight
+        self.focal_gamma = focal_gamma
 
         # 渐进式解冻：warmup_epochs > 0 时，前 N 个 epoch 冻结骨干
         self.warmup_epochs = warmup_epochs
@@ -154,13 +156,46 @@ class ValveRegressionModel(pl.LightningModule):
                 weights.append(1.0)
         return torch.tensor(weights, dtype=torch.float32, device=self.device)
 
+    def _compute_view_mae(
+        self,
+        pred_angles: torch.Tensor,
+        true_angles: torch.Tensor,
+        views: list,
+    ) -> dict:
+        """按视角分别计算 MAE
+
+        Args:
+            pred_angles: 预测角度（度数）(B,)
+            true_angles: 真实角度（度数）(B,)
+            views: 视角标签列表
+
+        Returns:
+            包含各视角 MAE 的字典
+        """
+        abs_errors = torch.abs(pred_angles - true_angles)
+        side_mask = torch.tensor(
+            [v == "side" for v in views], dtype=torch.bool, device=self.device
+        )
+        top_mask = ~side_mask
+
+        result = {}
+        if side_mask.any():
+            result["side_mae"] = abs_errors[side_mask].mean()
+        if top_mask.any():
+            result["top_mae"] = abs_errors[top_mask].mean()
+        return result
+
     def _compute_loss(
         self,
         predictions: torch.Tensor,
         targets: torch.Tensor,
         sample_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """计算组合损失（支持逐样本加权）
+        """计算组合损失（支持逐样本加权 + 难样本挖掘）
+
+        当 focal_gamma > 0 时，根据每个样本的预测误差自适应调整权重：
+        focal_weight = (abs_error ^ gamma) / mean(abs_error ^ gamma)
+        误差越大的样本权重越高，自动聚焦难样本。
 
         Args:
             predictions: 预测值（归一化）(B, 1)
@@ -173,6 +208,16 @@ class ValveRegressionModel(pl.LightningModule):
         mae = self.l1_loss(predictions, targets).squeeze(1)  # (B,)
         mse = self.mse_loss(predictions, targets).squeeze(1)  # (B,)
         per_sample_loss = self.mae_weight * mae + self.mse_weight * mse
+
+        # 难样本挖掘：根据误差自适应加权
+        if self.focal_gamma > 0 and self.training:
+            abs_error = mae.detach()  # 停止梯度，只用于权重计算
+            # 归一化误差到 [0, 1] 范围（归一化角度空间最大误差为 1）
+            focal_weight = (abs_error ** self.focal_gamma)
+            focal_mean = focal_weight.mean()
+            if focal_mean > 0:
+                focal_weight = focal_weight / focal_mean
+            per_sample_loss = per_sample_loss * focal_weight
 
         if sample_weights is not None:
             per_sample_loss = per_sample_loss * sample_weights
@@ -222,18 +267,27 @@ class ValveRegressionModel(pl.LightningModule):
         loss = self._compute_loss(predictions, angles, sample_weights)
 
         # 计算角度空间的 MAE（用于监控）
-        pred_angles = self._denormalize(predictions)
-        true_angles = self._denormalize(angles)
+        pred_angles = self._denormalize(predictions).squeeze(1)
+        true_angles = self._denormalize(angles).squeeze(1)
         mae_degrees = torch.mean(torch.abs(pred_angles - true_angles))
 
         # 记录日志
         self.log("train_loss", loss, prog_bar=True)
         self.log("train_mae", mae_degrees, prog_bar=True)
 
+        # 分视角 MAE
+        view_mae = self._compute_view_mae(pred_angles, true_angles, views)
+        if "side_mae" in view_mae:
+            self.log("train_side_mae", view_mae["side_mae"])
+        if "top_mae" in view_mae:
+            self.log("train_top_mae", view_mae["top_mae"])
+
         return loss
 
     def validation_step(self, batch: dict, batch_idx: int) -> None:
         """验证步骤
+
+        验证时使用等权损失，记录真实 MAE 和分视角 MAE。
 
         Args:
             batch: 数据批次
@@ -245,18 +299,24 @@ class ValveRegressionModel(pl.LightningModule):
 
         predictions = self(images)
 
-        # 验证时也使用视角加权，保持与训练一致
-        sample_weights = self._build_sample_weights(views)
-        loss = self._compute_loss(predictions, angles, sample_weights)
+        # 验证时使用等权损失，记录真实 MAE
+        loss = self._compute_loss(predictions, angles)
 
-        pred_angles = self._denormalize(predictions)
-        true_angles = self._denormalize(angles)
+        pred_angles = self._denormalize(predictions).squeeze(1)
+        true_angles = self._denormalize(angles).squeeze(1)
         mae_degrees = torch.mean(torch.abs(pred_angles - true_angles))
         mse_degrees = torch.mean((pred_angles - true_angles) ** 2)
 
         self.log("val_loss", loss, prog_bar=True)
         self.log("val_mae", mae_degrees, prog_bar=True)
         self.log("val_mse", mse_degrees)
+
+        # 分视角 MAE
+        view_mae = self._compute_view_mae(pred_angles, true_angles, views)
+        if "side_mae" in view_mae:
+            self.log("val_side_mae", view_mae["side_mae"])
+        if "top_mae" in view_mae:
+            self.log("val_top_mae", view_mae["top_mae"])
 
     def test_step(self, batch: dict, batch_idx: int) -> None:
         """测试步骤
@@ -405,7 +465,8 @@ def parse_args():
     # 损失函数参数
     parser.add_argument("--mae_weight", type=float, default=0.7, help="MAE 损失权重")
     parser.add_argument("--mse_weight", type=float, default=0.3, help="MSE 损失权重")
-    parser.add_argument("--side_weight", type=float, default=2.0, help="side 视角样本损失权重（1.0=等权，>1 提升 side 重要性）")
+    parser.add_argument("--side_weight", type=float, default=5.0, help="side 视角样本损失权重（1.0=等权，>1 提升 side 重要性）")
+    parser.add_argument("--focal_gamma", type=float, default=2.0, help="难样本挖掘的 focal gamma（0=关闭，>0 误差越大的样本权重越高）")
 
     # 其他参数
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
@@ -414,6 +475,11 @@ def parse_args():
         "--config_dir", type=str, default="./config",
         help="配置文件目录"
     )
+
+    # 两阶段训练参数
+    parser.add_argument("--stage2", action="store_true", help="启用两阶段训练：第一阶段用 all_view，第二阶段用 side_view 微调")
+    parser.add_argument("--stage2_epochs", type=int, default=30, help="第二阶段训练轮数")
+    parser.add_argument("--stage2_lr", type=float, default=1e-5, help="第二阶段学习率（默认 1e-5，比第一阶段低 10x）")
 
     return parser.parse_args()
 
@@ -445,7 +511,7 @@ def main():
         batch_size = args.batch_size
 
     # 创建数据增强
-    train_transforms, val_transforms = get_transforms_from_config(
+    train_transforms, train_transforms_side, val_transforms = get_transforms_from_config(
         data_config, image_size=image_size
     )
 
@@ -461,6 +527,7 @@ def main():
         test_ratio=data_config.get("test_ratio", 0.1),
         seed=args.seed,
         train_transform=train_transforms,
+        train_transform_side=train_transforms_side,
         val_transform=val_transforms,
         angle_min=data_config.get("angle_min", 0.0),
         angle_max=data_config.get("angle_max", 80.0),
@@ -482,6 +549,7 @@ def main():
         eta_min=train_config.get("scheduler", {}).get("eta_min", 1e-6),
         warmup_epochs=args.warmup_epochs,
         side_weight=args.side_weight,
+        focal_gamma=args.focal_gamma,
     )
 
     logger.info(f"模型: {args.model}")
@@ -495,6 +563,8 @@ def main():
     logger.info(f"学习率: {args.lr}")
     if args.side_weight != 1.0:
         logger.info(f"视角加权: side 视角损失权重 = {args.side_weight}")
+    if args.focal_gamma > 0:
+        logger.info(f"难样本挖掘: focal_gamma = {args.focal_gamma}")
 
     # 回调函数
     callbacks = []
@@ -555,6 +625,101 @@ def main():
     # 训练完成后在测试集上评估
     logger.info("训练完成，在测试集上评估...")
     trainer.test(model, data_module)
+
+    # 两阶段训练：第二阶段用 side_view 微调
+    if args.stage2:
+        logger.info("=" * 60)
+        logger.info("第二阶段训练：使用 side_view 数据微调")
+        logger.info(f"学习率: {args.stage2_lr}")
+        logger.info(f"训练轮数: {args.stage2_epochs}")
+        logger.info("=" * 60)
+
+        # 找到第一阶段的最佳 checkpoint
+        best_ckpt = None
+        for cb in callbacks:
+            if isinstance(cb, ModelCheckpoint):
+                best_ckpt = cb.best_model_path
+                break
+
+        if best_ckpt is None:
+            best_ckpt = os.path.join(
+                model_config.get("save_dir", "./weights"), "last.ckpt"
+            )
+
+        logger.info(f"加载第一阶段最佳模型: {best_ckpt}")
+
+        # 创建 side_view 数据模块
+        side_data_module = ValveDataModule(
+            data_dir=args.data_dir,
+            view="side_view",
+            image_size=image_size,
+            batch_size=batch_size,
+            num_workers=args.num_workers,
+            train_ratio=data_config.get("train_ratio", 0.8),
+            val_ratio=data_config.get("val_ratio", 0.1),
+            test_ratio=data_config.get("test_ratio", 0.1),
+            seed=args.seed,
+            train_transform=train_transforms,
+            train_transform_side=train_transforms_side,
+            val_transform=val_transforms,
+            angle_min=data_config.get("angle_min", 0.0),
+            angle_max=data_config.get("angle_max", 80.0),
+        )
+
+        # 加载第一阶段模型，覆盖学习率
+        stage2_model = ValveRegressionModel.load_from_checkpoint(
+            best_ckpt,
+            lr=args.stage2_lr,
+        )
+
+        # 第二阶段的回调
+        stage2_callbacks = []
+        stage2_callbacks.append(
+            EarlyStopping(
+                monitor="val_mae",
+                patience=15,
+                mode="min",
+                min_delta=0.01,
+            )
+        )
+        stage2_callbacks.append(
+            ModelCheckpoint(
+                dirpath=os.path.join(
+                    model_config.get("save_dir", "./weights"), "stage2"
+                ),
+                monitor="val_mae",
+                mode="min",
+                save_top_k=3,
+                filename="valve-stage2-{epoch:03d}-{val_mae:.4f}",
+                save_last=True,
+            )
+        )
+        stage2_callbacks.append(LearningRateMonitor(logging_interval="epoch"))
+
+        # 第二阶段日志
+        stage2_tb_logger = TensorBoardLogger(
+            save_dir=train_config.get("tensorboard_dir", "./logs/tensorboard"),
+            name=f"{args.model}_stage2",
+        )
+
+        # 第二阶段训练器
+        stage2_trainer = pl.Trainer(
+            max_epochs=args.stage2_epochs,
+            callbacks=stage2_callbacks,
+            logger=stage2_tb_logger,
+            accelerator="auto",
+            devices="auto",
+            precision=train_config.get("precision", "16-mixed"),
+            gradient_clip_val=train_config.get("gradient_clip", {}).get("max_norm", 1.0)
+                if train_config.get("gradient_clip", {}).get("enabled", True) else 0.0,
+            log_every_n_steps=train_config.get("log_every_n_steps", 10),
+            deterministic=False,
+        )
+
+        stage2_trainer.fit(stage2_model, side_data_module)
+        stage2_trainer.test(stage2_model, side_data_module)
+
+        logger.info("第二阶段训练完成！")
 
     logger.info("全部完成！")
 

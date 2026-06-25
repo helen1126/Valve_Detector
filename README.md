@@ -11,10 +11,17 @@
 ## 功能特性
 
 - **多模型支持**：内置 ResNet50/101、EfficientNet-B4/B5、ConvNeXt-Base/Large、Swin-Base/Large 等多种骨干网络，推荐使用 ConvNeXt-Base
-- **数据增强**：基于 Albumentations 的丰富增强策略（亮度对比度、色调饱和度、高斯模糊/噪声、随机裁剪、遮挡等），不使用旋转和翻转以避免角度语义改变
+- **数据增强**：基于 Albumentations 的丰富增强策略（亮度对比度、色调饱和度、高斯模糊/噪声、随机裁剪、遮挡、透视变换、镜头畸变等），不使用旋转和翻转以避免角度语义改变
+- **视角感知训练**：支持 side 视角样本加权（`side_weight`）、过采样、专用增强流水线，针对侧视角预测精度优化
+- **难样本挖掘损失**：Focal-style 自适应损失，根据预测误差动态调整样本权重，误差越大的样本权重越高
+- **两阶段训练**：先用 all_view 训练基础模型，再用 side_view 数据低学习率微调，提升 side 视角精度
+- **渐进式解冻**：支持 warmup 阶段冻结骨干网络，之后解冻微调，加速收敛
+- **自适应 batch_size**：根据 GPU 显存和模型类型自动计算最优批大小
 - **图像优化**：提供颜色增强、边缘检测、区域提取、光照校正（CLAHE + Gamma）等阀门图像专用优化技术
-- **API 接口**：基于 FastAPI 的 RESTful API，支持单张/批量预测、健康检查、模型信息查询，自带 Swagger/ReDoc 文档
-- **前端 Demo**：基于 Streamlit 的交互式 Web 界面，支持单张/批量预测和结果可视化
+- **远距离优化**：智能裁剪自动定位并放大阀门区域，多尺度推理融合原图和裁剪图预测，提升远距离拍摄精度
+- **视频抽帧推理**：支持视频文件抽帧预测，可选择按 fps 或帧间隔抽帧，输出标注视频和角度变化曲线
+- **API 接口**：基于 FastAPI 的 RESTful API，支持单张/批量/视频预测、健康检查、模型信息查询，自带 Swagger/ReDoc 文档
+- **前端 Demo**：基于 Streamlit 的交互式 Web 界面，支持单张/批量/视频预测和结果可视化
 
 ## 环境搭建
 
@@ -45,6 +52,21 @@ conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia
 pip install -r requirements.txt
 ```
 
+**云服务器注意事项**：
+
+如果部署在无图形界面的云服务器上，需要替换 `opencv-python` 为 `opencv-python-headless`：
+
+```bash
+pip uninstall opencv-python -y
+pip install opencv-python-headless
+```
+
+如果无法访问 HuggingFace，设置国内镜像：
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
 ## 快速开始
 
 ### 训练
@@ -55,6 +77,15 @@ python train.py --model convnext_base --data_dir ./dataset --view all_view
 
 # 使用 ResNet50 训练
 python train.py --model resnet50 --epochs 100 --batch_size 16
+
+# 启用视角加权 + 难样本挖掘（提升 side 视角精度）
+python train.py --model convnext_base --view all_view --side_weight 5.0 --focal_gamma 2.0
+
+# 两阶段训练：先 all_view 训练，再用 side_view 微调
+python train.py --model convnext_base --view all_view --stage2 --stage2_epochs 30 --stage2_lr 1e-5
+
+# 渐进式解冻：前 5 个 epoch 冻结骨干，之后解冻微调
+python train.py --model convnext_base --warmup_epochs 5
 
 # 从检查点恢复训练
 python train.py --model convnext_base --resume ./weights/valve-epoch=XX-val_mae=XX.ckpt
@@ -79,11 +110,23 @@ python predict.py --model_path ./weights/last.ckpt --input ./test.jpg
 # 批量预测
 python predict.py --model_path ./weights/last.ckpt --input ./test_images/ --output ./results/
 
+# 启用智能裁剪（远距离拍摄优化）
+python predict.py --model_path ./weights/last.ckpt --input ./test.jpg --smart_crop
+
+# 启用多尺度推理（精度最高）
+python predict.py --model_path ./weights/last.ckpt --input ./test.jpg --multi_scale
+
 # 使用 ONNX 模型推理
 python predict.py --model_path ./weights/model.onnx --input ./test.jpg --onnx
 
 # 启用图像优化
 python predict.py --model_path ./weights/last.ckpt --input ./test.jpg --optimize
+
+# 视频抽帧预测（按每秒 2 帧抽帧）
+python predict.py --model_path ./weights/last.ckpt --input ./test.mp4 --fps 2
+
+# 视频抽帧预测（每 30 帧抽 1 帧，输出标注视频）
+python predict.py --model_path ./weights/last.ckpt --input ./test.mp4 --frame_interval 30 --save_video
 ```
 
 ### API 服务
@@ -94,6 +137,14 @@ uvicorn api.main:app --host 0.0.0.0 --port 8000
 
 # 开发模式（自动重载）
 uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+
+# 启动 API 服务（使用 SSL）
+$env:SSL_KEYFILE="certs/key.pem"
+$env:SSL_CERTFILE="certs/cert.pem"
+python -m api.main
+
+# 启动 API 服务（使用 SSL，指定证书文件）
+uvicorn api.main:app --host 0.0.0.0 --port 8000 --ssl-keyfile certs/key.pem --ssl-certfile certs/cert.pem
 ```
 
 启动后访问：
@@ -112,7 +163,7 @@ streamlit run frontend/app.py
 Valve_Detector/
 ├── api/                        # API 服务
 │   ├── __init__.py
-│   └── main.py                 # FastAPI 应用（/predict、/predict/batch、/health、/info）
+│   └── main.py                 # FastAPI 应用（/predict、/predict/batch、/predict/video、/health、/info）
 ├── config/                     # 配置文件
 │   ├── data_config.yaml        # 数据配置（路径、增强、预处理）
 │   ├── model_config.yaml       # 模型配置（架构、ONNX导出）
